@@ -1,0 +1,6 @@
+firmware/build/
+Debug/
+Release/
+*.o
+*.d
+testdata/*.bin
