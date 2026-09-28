@@ -16,5 +16,7 @@ bool touch_init(touch_info_t *info);
 /* Raw panel coordinates of the first touch point; false if not touched */
 bool touch_read_raw(uint16_t *x, uint16_t *y);
 bool touch_int_active(void);   /* INT pin (PD4) low */
+/* Touch position in screen pixels (320x240 landscape); false if not touched */
+bool touch_read(int16_t *sx, int16_t *sy);
 
 #endif

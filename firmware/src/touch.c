@@ -136,3 +136,24 @@ bool touch_int_active(void)
 {
     return HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_4) == GPIO_PIN_RESET;
 }
+
+/*
+ * Map to landscape screen coordinates. Calibration measured on the device
+ * (2026-09-28): raw (204,45) at screen (30,30), raw (0,302) at (290,210).
+ * Screen X follows raw y; screen Y follows raw x, mirrored.
+ */
+bool touch_read(int16_t *sx, int16_t *sy)
+{
+    uint16_t rx, ry;
+
+    if (!touch_read_raw(&rx, &ry)) return false;
+    int32_t x = 30 + ((int32_t)ry - 45) * 260 / 257;
+    int32_t y = 30 + ((int32_t)rx - 204) * 180 / -204;
+    if (x < 0) x = 0;
+    if (x > 319) x = 319;
+    if (y < 0) y = 0;
+    if (y > 239) y = 239;
+    *sx = (int16_t)x;
+    *sy = (int16_t)y;
+    return true;
+}

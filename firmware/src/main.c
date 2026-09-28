@@ -1,14 +1,13 @@
 /*
  * Slitscan camera firmware v2
  *
- * Milestone M2: display and touch bring-up.
- *  1. Starts the board (clocks, RTC, SDRAM, SD card log) as in M1.
- *  2. Initialises the ILI9341 and the FT6336 and logs their IDs.
- *  3. Orientation and colour test screen (the backlight is always on).
- *  4. Touch calibration (tap two targets), then a crosshair test.
+ * Milestone M3: sensor live view (no recording yet).
+ * Powers the ILX514, runs the capture chain taken from the original firmware
+ * and shows the current line as a waveform, with statistics and a histogram.
+ * Buttons: line time -/+, SAVE (writes the current line to LINEnnn.CSV).
  */
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 #include "stm32h7xx_hal.h"
 #include "board.h"
 #include "sdram.h"
@@ -17,185 +16,168 @@
 #include "log.h"
 #include "lcd.h"
 #include "touch.h"
+#include "sensor.h"
 #include "ff.h"
 
 const char fw_version[] = "slitscan " FW_VERSION;
 
 static FATFS fs;
+static FIL file;
 static bool mounted;
+static uint16_t line[SENSOR_SAMPLES];
 
-/* ------------------------------------------------------------ orientation test */
+/* Line time presets in us; 7000 is the original firmware's default */
+static const uint32_t presets[] = { 2500, 3000, 4000, 5000, 7000, 10000, 14000, 20000, 30000 };
+#define N_PRESETS (sizeof(presets) / sizeof(presets[0]))
+static unsigned preset = 4;
 
-/*
- * White frame on the outermost pixels, corner labels, and labelled colour bars.
- * If the frame is fully visible and the labels match their corners, the
- * 320x240 drawing area lines up with the glass.
- */
-static void orientation_test(void)
-{
-    static const struct { uint16_t color; const char *name; } bars[] = {
-        { LCD_RED, "RED" }, { LCD_GREEN, "GRN" }, { LCD_BLUE, "BLU" }, { LCD_WHITE, "WHT" },
-        { LCD_YELLOW, "YEL" }, { LCD_CYAN, "CYN" }, { LCD_GREY, "GRY" }, { LCD_BLACK, "BLK" },
-    };
-    uint16_t tx, ty;
+/* Screen layout (top rows hide under the bezel, so start at y = 4) */
+#define WAVE_Y     22
+#define WAVE_H     120
+#define STATS_Y    (WAVE_Y + WAVE_H + 4)
+#define HIST_Y     170
+#define HIST_H     30
+#define BTN_Y      206
+#define BTN_H      32
+#define WAVE_BG    RGB565(20, 20, 40)
 
-    lcd_clear(LCD_BLACK);
-    lcd_fill(0, 0, LCD_W, 1, LCD_WHITE);
-    lcd_fill(0, LCD_H - 1, LCD_W, 1, LCD_WHITE);
-    lcd_fill(0, 0, 1, LCD_H, LCD_WHITE);
-    lcd_fill(LCD_W - 1, 0, 1, LCD_H, LCD_WHITE);
-
-    lcd_text(4, 4, "TOP LEFT", LCD_GREEN, LCD_BLACK, 1);
-    lcd_text((uint16_t)(LCD_W - 4 - lcd_text_width("TOP RIGHT", 1)), 4, "TOP RIGHT", LCD_GREEN, LCD_BLACK, 1);
-    lcd_text(4, LCD_H - 14, "BOTTOM LEFT", LCD_GREEN, LCD_BLACK, 1);
-    lcd_text((uint16_t)(LCD_W - 4 - lcd_text_width("BOTTOM RIGHT", 1)), LCD_H - 14, "BOTTOM RIGHT", LCD_GREEN, LCD_BLACK, 1);
-
-    lcd_text(40, 40, "SCREEN TEST", LCD_WHITE, LCD_BLACK, 3);        /* 11 chars x 24 = 264 px */
-    lcd_text(40, 80, "Tap to continue", LCD_WHITE, LCD_BLACK, 2);    /* 15 chars x 16 = 240 px */
-
-    for (unsigned i = 0; i < 8; i++) {
-        uint16_t x = (uint16_t)(i * 40);
-        lcd_fill(x, 150, 40, 50, bars[i].color);
-        lcd_text((uint16_t)(x + 8), 205, bars[i].name, LCD_WHITE, LCD_BLACK, 1);
-    }
-
-    uint32_t t0 = HAL_GetTick();
-    while (!touch_read_raw(&tx, &ty) && HAL_GetTick() - t0 < 60000) {
-        HAL_Delay(20);
-    }
-    while (touch_read_raw(&tx, &ty)) {
-        HAL_Delay(20);
-    }
-}
-
-/* ------------------------------------------------------------ touch */
+typedef struct { uint16_t x, w; const char *label; } button_t;
+static const button_t btn_minus = { 4, 70, "-" };
+static const button_t btn_save  = { 118, 84, "SAVE" };
+static const button_t btn_plus  = { 246, 70, "+" };
 
 typedef struct {
-    bool swap;                 /* screen X comes from raw y */
-    int32_t x0, rx0, x_num, x_den;
-    int32_t y0, ry0, y_num, y_den;
-} touch_cal_t;
+    uint16_t min, max, mean, black;
+    uint32_t clipped;    /* active pixels at 4095 */
+} line_stats_t;
 
-static touch_cal_t cal = {
-    /* Measured on the device 2026-09-28: raw (204,45) at (30,30), raw (0,302) at (290,210) */
-    .swap = true, .x0 = 30, .rx0 = 45, .x_num = 260, .x_den = 257,
-    .y0 = 30, .ry0 = 204, .y_num = 180, .y_den = -204,
-};
+/* ------------------------------------------------------------ drawing */
 
-static void touch_map(uint16_t rx, uint16_t ry, int32_t *sx, int32_t *sy)
+static void draw_button(const button_t *b, uint16_t color)
 {
-    int32_t a = cal.swap ? ry : rx;   /* raw value that drives screen X */
-    int32_t b = cal.swap ? rx : ry;
-    *sx = cal.x0 + (a - cal.rx0) * cal.x_num / cal.x_den;
-    *sy = cal.y0 + (b - cal.ry0) * cal.y_num / cal.y_den;
+    lcd_fill(b->x, BTN_Y, b->w, BTN_H, color);
+    uint16_t tw = lcd_text_width(b->label, 2);
+    lcd_text((uint16_t)(b->x + (b->w - tw) / 2), BTN_Y + 6, b->label, LCD_WHITE, color, 2);
 }
 
-/* Wait for a touch, average a few samples, then wait for release. */
-static bool wait_tap(uint16_t *rx, uint16_t *ry, uint32_t timeout_ms)
+static bool hit(const button_t *b, int16_t x, int16_t y)
 {
-    uint32_t t0 = HAL_GetTick();
-    uint16_t x, y;
-
-    while (!touch_read_raw(&x, &y)) {
-        if (HAL_GetTick() - t0 > timeout_ms) return false;
-        HAL_Delay(10);
-    }
-    uint32_t sx = 0, sy = 0, n = 0;
-    for (int i = 0; i < 8; i++) {
-        HAL_Delay(15);
-        if (touch_read_raw(&x, &y)) { sx += x; sy += y; n++; }
-    }
-    while (touch_read_raw(&x, &y)) HAL_Delay(10);
-    if (n == 0) return false;
-    *rx = (uint16_t)(sx / n);
-    *ry = (uint16_t)(sy / n);
-    return true;
+    return x >= b->x && x < b->x + b->w && y >= BTN_Y && y < BTN_Y + BTN_H;
 }
 
-static void draw_target(int32_t x, int32_t y, uint16_t color)
+static void draw_static(void)
 {
-    lcd_fill((uint16_t)(x - 12), (uint16_t)y, 25, 1, color);
-    lcd_fill((uint16_t)x, (uint16_t)(y - 12), 1, 25, color);
-    lcd_fill((uint16_t)(x - 3), (uint16_t)(y - 3), 7, 7, color);
-}
-
-static void touch_calibrate(void)
-{
-    const int32_t ax = 30, ay = 30, bx = LCD_W - 30, by = LCD_H - 30;
-    uint16_t arx, ary, brx, bry;
-
     lcd_clear(LCD_BLACK);
-    lcd_text(60, 100, "Tap the red target", LCD_WHITE, LCD_BLACK, 2);
-    draw_target(ax, ay, LCD_RED);
-    if (!wait_tap(&arx, &ary, 30000)) {
-        log_printf("Touch calibration: no tap, using default mapping\r\n");
-        return;
-    }
-    draw_target(ax, ay, LCD_BLACK);
-    draw_target(bx, by, LCD_RED);
-    if (!wait_tap(&brx, &bry, 30000)) {
-        log_printf("Touch calibration: no second tap, using default mapping\r\n");
-        return;
-    }
-
-    /* The raw axis that changed most between the targets follows screen X (the longer distance) */
-    int32_t dxr = (int32_t)brx - arx, dyr = (int32_t)bry - ary;
-    cal.swap = abs(dyr) > abs(dxr);
-    int32_t da = cal.swap ? dyr : dxr;   /* raw change along screen X */
-    int32_t db = cal.swap ? dxr : dyr;   /* raw change along screen Y */
-    if (da == 0 || db == 0) {
-        log_printf("Touch calibration: taps too close, using default mapping\r\n");
-        return;
-    }
-    cal.x0 = ax; cal.rx0 = cal.swap ? ary : arx; cal.x_num = bx - ax; cal.x_den = da;
-    cal.y0 = ay; cal.ry0 = cal.swap ? arx : ary; cal.y_num = by - ay; cal.y_den = db;
-    log_printf("Touch calibration: raw (%u,%u) at (%ld,%ld), raw (%u,%u) at (%ld,%ld); axes %s, X %s, Y %s\r\n",
-               arx, ary, ax, ay, brx, bry, bx, by, cal.swap ? "swapped" : "straight",
-               (cal.x_num > 0) == (cal.x_den > 0) ? "normal" : "mirrored",
-               (cal.y_num > 0) == (cal.y_den > 0) ? "normal" : "mirrored");
+    draw_button(&btn_minus, LCD_GREY);
+    draw_button(&btn_save, RGB565(0, 90, 160));
+    draw_button(&btn_plus, LCD_GREY);
 }
 
-static void touch_test(void)
+static void draw_top(uint32_t lines_per_s, uint32_t sync_errors)
 {
-    char line[48];
-    int32_t lx = -1, ly = -1;
-    uint32_t taps = 0, last_flush = HAL_GetTick();
-    bool was_down = false;
+    char s[48];
+    uint32_t us = sensor_line_us();
+    snprintf(s, sizeof(s), "LIVE  %lu.%lu ms  %3lu lines/s  sync err %lu   ",
+             us / 1000, (us % 1000) / 100, lines_per_s, sync_errors);
+    lcd_text(4, 6, s, LCD_WHITE, LCD_BLACK, 1);
+}
 
-    lcd_clear(LCD_BLACK);
-    lcd_text(10, 8, "TOUCH TEST: draw with a finger", LCD_WHITE, LCD_BLACK, 1);
-    lcd_text(10, 22, "Top-left corner is here", LCD_GREY, LCD_BLACK, 1);
-    lcd_fill(0, 0, 6, 6, LCD_GREEN);
+static uint16_t wave_y(uint16_t v)
+{
+    return (uint16_t)(WAVE_Y + WAVE_H - 1 - (uint32_t)v * (WAVE_H - 1) / 4095);
+}
 
-    while (1) {
-        uint16_t rx, ry;
-        if (touch_read_raw(&rx, &ry)) {
-            int32_t sx, sy;
-            touch_map(rx, ry, &sx, &sy);
-            if (sx >= 0 && sx < LCD_W && sy >= 0 && sy < LCD_H) {
-                if (lx >= 0 && (abs(sx - lx) > 1 || abs(sy - ly) > 1)) {
-                    lcd_fill((uint16_t)lx, (uint16_t)ly, 3, 3, LCD_GREY);   /* trail */
-                }
-                lcd_fill((uint16_t)sx, (uint16_t)sy, 3, 3, LCD_YELLOW);
-                lx = sx; ly = sy;
-            }
-            snprintf(line, sizeof(line), "raw %4u,%4u  screen %4ld,%4ld  ", rx, ry, sx, sy);
-            lcd_text(10, LCD_H - 14, line, LCD_CYAN, LCD_BLACK, 1);
-            if (!was_down) {
-                taps++;
-                if (taps <= 20) log_printf("  touch %lu: raw %u,%u -> screen %ld,%ld\r\n", taps, rx, ry, sx, sy);
-            }
-            was_down = true;
-        } else {
-            was_down = false;
+/* One screen column per 12.8 samples: draw the min..max range of each column */
+static void draw_wave(const uint16_t *d)
+{
+    for (uint16_t x = 0; x < LCD_W; x++) {
+        uint32_t a = (uint32_t)x * SENSOR_SAMPLES / LCD_W;
+        uint32_t b = (uint32_t)(x + 1) * SENSOR_SAMPLES / LCD_W;
+        uint16_t lo = 4095, hi = 0;
+        for (uint32_t i = a; i < b; i++) {
+            if (d[i] < lo) lo = d[i];
+            if (d[i] > hi) hi = d[i];
         }
-        if (mounted && HAL_GetTick() - last_flush > 5000) {
-            log_flush();
-            last_flush = HAL_GetTick();
-        }
-        HAL_Delay(15);
-        board_led((HAL_GetTick() / 500) & 1);
+        bool black = b <= SENSOR_BLACK_LAST + 1;
+        bool active = a >= SENSOR_ACTIVE_FIRST && b <= SENSOR_ACTIVE_LAST + 1;
+        uint16_t color = black ? LCD_CYAN : active ? LCD_YELLOW : LCD_GREY;
+        uint16_t y_hi = wave_y(hi), y_lo = wave_y(lo);
+        lcd_fill(x, WAVE_Y, 1, WAVE_H, WAVE_BG);
+        lcd_fill(x, y_hi, 1, (uint16_t)(y_lo - y_hi + 1), color);
     }
+}
+
+static void compute_stats(const uint16_t *d, line_stats_t *st, uint16_t hist[128])
+{
+    uint32_t sum = 0, n = 0, bsum = 0;
+
+    memset(hist, 0, 128 * sizeof(uint16_t));
+    st->min = 4095;
+    st->max = 0;
+    st->clipped = 0;
+    for (uint32_t i = SENSOR_ACTIVE_FIRST; i <= SENSOR_ACTIVE_LAST; i++) {
+        uint16_t v = d[i];
+        if (v < st->min) st->min = v;
+        if (v > st->max) st->max = v;
+        if (v >= 4095) st->clipped++;
+        sum += v;
+        n++;
+        hist[v >> 5]++;
+    }
+    for (uint32_t i = SENSOR_BLACK_FIRST; i <= SENSOR_BLACK_LAST; i++) {
+        bsum += d[i];
+    }
+    st->mean = (uint16_t)(sum / n);
+    st->black = (uint16_t)(bsum / (SENSOR_BLACK_LAST - SENSOR_BLACK_FIRST + 1));
+}
+
+static void draw_stats(const line_stats_t *st, const uint16_t hist[128])
+{
+    char s[64];
+    snprintf(s, sizeof(s), "min %4u  max %4u  mean %4u  black %4u  ", st->min, st->max, st->mean, st->black);
+    lcd_text(4, STATS_Y, s, LCD_WHITE, LCD_BLACK, 1);
+    snprintf(s, sizeof(s), "clipped %lu px   ", st->clipped);
+    lcd_text(4, STATS_Y + 12, s, st->clipped ? LCD_RED : LCD_GREY, LCD_BLACK, 1);
+
+    uint16_t peak = 1;
+    for (int i = 0; i < 128; i++) if (hist[i] > peak) peak = hist[i];
+    for (int i = 0; i < 128; i++) {
+        uint16_t h = (uint16_t)((uint32_t)hist[i] * HIST_H / peak);
+        uint16_t x = (uint16_t)(32 + i * 2);
+        lcd_fill(x, HIST_Y, 2, (uint16_t)(HIST_H - h), LCD_BLACK);
+        if (h) lcd_fill(x, (uint16_t)(HIST_Y + HIST_H - h), 2, h, LCD_GREEN);
+    }
+}
+
+/* ------------------------------------------------------------ saving */
+
+static void save_line(const uint16_t *d, const line_stats_t *st)
+{
+    char name[16];
+    static unsigned n;
+
+    if (!mounted) {
+        lcd_text(4, STATS_Y + 12, "no SD card        ", LCD_RED, LCD_BLACK, 1);
+        return;
+    }
+    for (n = n ? n : 1; n < 1000; n++) {
+        snprintf(name, sizeof(name), "LINE%03u.CSV", n);
+        if (f_open(&file, name, FA_CREATE_NEW | FA_WRITE) == FR_OK) break;
+    }
+    if (n >= 1000) return;
+    f_printf(&file, "# %s, line time %lu us, pixel 500 ns, 12-bit ADC\n", fw_version, sensor_line_us());
+    f_printf(&file, "sample,value\n");
+    for (int i = 0; i < SENSOR_SAMPLES; i++) {
+        f_printf(&file, "%d,%u\n", i, d[i]);
+    }
+    f_close(&file);
+    log_printf("Saved %s: line %lu us, min %u max %u mean %u black %u clipped %lu\r\n",
+               name, sensor_line_us(), st->min, st->max, st->mean, st->black, st->clipped);
+    log_flush();
+    char s[32];
+    snprintf(s, sizeof(s), "saved %s   ", name);
+    lcd_text(4, STATS_Y + 12, s, LCD_GREEN, LCD_BLACK, 1);
+    n++;
 }
 
 /* ------------------------------------------------------------ main */
@@ -205,49 +187,91 @@ int main(void)
     board_early_init();
     HAL_Init();
     board_init();
-    board_leds_carrier(1);
 
     rtclock_status_t rtc = rtclock_init();
-    log_printf("\r\n===== %s boot at ", fw_version);
     rtclock_time_t t;
+    log_printf("\r\n===== %s boot at ", fw_version);
     if (rtclock_get(&t)) {
         log_printf("%04u-%02u-%02u %02u:%02u:%02u", t.year, t.month, t.day, t.hour, t.min, t.sec);
     }
     log_printf(" =====\r\nReset cause:  %s\r\nClock:        %s\r\n", board_reset_cause_str(), rtclock_status_str(rtc));
-
-    board_leds_carrier(2);
     log_printf("SDRAM:        %s\r\n", sdram_init() ? "initialised" : "FAILED to initialise");
-
-    board_leds_carrier(3);
     if (sdcard_init() && f_mount(&fs, "", 1) == FR_OK) {
         mounted = true;
         sdcard_set_high_speed(true);
-        log_printf("SD card:      mounted\r\n");
     }
+    log_printf("SD card:      %s\r\n", mounted ? "mounted" : "not available");
 
-    board_leds_carrier(4);
-    if (!lcd_init()) {
-        log_printf("Display:      SPI init FAILED\r\n");
-    } else {
-        uint8_t id[4];
-        lcd_read_id(id);
-        log_printf("Display:      ID bytes %02x %02x %02x %02x (ILI9341 = xx 00 93 41)\r\n", id[0], id[1], id[2], id[3]);
-    }
-
-    board_leds_carrier(5);
+    lcd_init();
     touch_info_t ti;
-    if (touch_init(&ti)) {
-        log_printf("Touch:        responds at 0x38; vendor 0x%02x, chip 0x%02x, firmware 0x%02x\r\n",
-                   ti.vendor_id, ti.chip_id, ti.fw_version);
+    touch_init(&ti);
+    lcd_clear(LCD_BLACK);
+    lcd_text(20, 100, "Starting sensor...", LCD_WHITE, LCD_BLACK, 2);
+
+    bool ok = sensor_start(presets[preset]);
+    if (ok) {
+        log_printf("Sensor:       started, line time %lu us\r\n", presets[preset]);
     } else {
-        log_printf("Touch:        NO RESPONSE at 0x38 (INT pin %s)\r\n", touch_int_active() ? "low" : "high");
+        log_printf("Sensor:       FAILED to start at step: %s\r\n", sensor_last_error());
     }
     if (mounted) log_flush();
+    if (!ok) {
+        lcd_text(20, 130, "Sensor start FAILED", LCD_RED, LCD_BLACK, 2);
+        lcd_text(20, 160, sensor_last_error(), LCD_RED, LCD_BLACK, 2);
+        while (1) {
+            board_led((HAL_GetTick() / 100) & 1);
+        }
+    }
 
-    board_leds_carrier(0);
-    orientation_test();
-    touch_calibrate();
-    if (mounted) log_flush();
-    log_printf("Touch test:\r\n");
-    touch_test();
+    draw_static();
+
+    line_stats_t st = {0};
+    uint16_t hist[128];
+    uint32_t last_draw = 0, last_rate = HAL_GetTick(), last_log = HAL_GetTick();
+    uint32_t lines_at_rate = 0, lines_per_s = 0;
+    bool touching = false, have_line = false;
+
+    while (1) {
+        uint32_t now = HAL_GetTick();
+        sensor_stats_t ss;
+        sensor_get_stats(&ss);
+
+        if (now - last_rate >= 1000) {
+            lines_per_s = (ss.lines - lines_at_rate) * 1000 / (now - last_rate);
+            lines_at_rate = ss.lines;
+            last_rate = now;
+        }
+
+        if (now - last_draw >= 150 && sensor_snapshot(line)) {
+            have_line = true;
+            compute_stats(line, &st, hist);
+            draw_top(lines_per_s, ss.sync_errors);
+            draw_wave(line);
+            draw_stats(&st, hist);
+            last_draw = now;
+        }
+
+        if (mounted && now - last_log >= 10000) {
+            log_printf("  %lu lines/s, sync errors %lu, DMA errors %lu, min %u max %u mean %u black %u\r\n",
+                       lines_per_s, ss.sync_errors, ss.dma_errors, st.min, st.max, st.mean, st.black);
+            log_flush();
+            last_log = now;
+        }
+
+        int16_t x, y;
+        bool down = touch_read(&x, &y);
+        if (down && !touching) {
+            if (hit(&btn_minus, x, y) && preset > 0) {
+                sensor_set_line_us(presets[--preset]);
+            } else if (hit(&btn_plus, x, y) && preset < N_PRESETS - 1) {
+                sensor_set_line_us(presets[++preset]);
+            } else if (hit(&btn_save, x, y) && have_line) {
+                save_line(line, &st);
+            }
+        }
+        touching = down;
+
+        board_led((now / 500) & 1);
+        HAL_Delay(5);
+    }
 }
