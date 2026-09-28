@@ -1,265 +1,253 @@
 /*
  * Slitscan camera firmware v2
  *
- * Milestone M1: board bring-up. Sets full clock speed, tests the 32 MB SDRAM,
- * starts the RTC without losing its time, mounts the SD card, measures card
- * speed and appends a report to LOG.TXT.
- *
- * Carrier LEDs while running: the step number (1..6).
- * Carrier LEDs when done: bit0 SDRAM ok, bit1 clock ok, bit2 card mounted,
- *   bit3 log written, bit4 card fast enough for recording.
- * Board LED when done: slow blink = all passed, fast blink = something failed.
+ * Milestone M2: display and touch bring-up.
+ *  1. Starts the board (clocks, RTC, SDRAM, SD card log) as in M1.
+ *  2. Initialises the ILI9341 and the FT6336 and logs their IDs.
+ *  3. Orientation and colour test screen (the backlight is always on).
+ *  4. Touch calibration (tap two targets), then a crosshair test.
  */
-#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "stm32h7xx_hal.h"
 #include "board.h"
 #include "sdram.h"
 #include "rtclock.h"
 #include "sdcard.h"
 #include "log.h"
+#include "lcd.h"
+#include "touch.h"
 #include "ff.h"
 
 const char fw_version[] = "slitscan " FW_VERSION;
 
-/* Recording at the fastest line rate needs ~3.7 MB/s; ask for margin. */
-#define REQUIRED_WRITE_KBPS  (6 * 1024)
-
-#define SPEED_FILE     "SPEEDTST.BIN"
-#define SPEED_BYTES    (16UL * 1024 * 1024)
-#define SPEED_CHUNK    (64UL * 1024)
-#define SPEED_SRC      ((uint8_t *)SDRAM_BASE)                    /* 1 MB of test pattern */
-#define SPEED_DST      ((uint8_t *)(SDRAM_BASE + 16UL * 1024 * 1024))
-
 static FATFS fs;
-static FIL file;
+static bool mounted;
 
-typedef struct {
-    bool ok;
-    const char *error;
-    uint32_t write_kbps, read_kbps;
-    uint32_t max_chunk_ms;
-} speed_t;
+/* ------------------------------------------------------------ orientation test */
 
-/* Print a KB/s value as MB/s with two decimals (no float printf in newlib-nano) */
-static void log_mbps(const char *label, uint32_t kbps)
+/*
+ * White frame on the outermost pixels, corner labels, and labelled colour bars.
+ * If the frame is fully visible and the labels match their corners, the
+ * 320x240 drawing area lines up with the glass.
+ */
+static void orientation_test(void)
 {
-    uint32_t hundredths = kbps * 100 / 1024;
-    log_printf("%s%lu.%02lu MB/s", label, hundredths / 100, hundredths % 100);
-}
+    static const struct { uint16_t color; const char *name; } bars[] = {
+        { LCD_RED, "RED" }, { LCD_GREEN, "GRN" }, { LCD_BLUE, "BLU" }, { LCD_WHITE, "WHT" },
+        { LCD_YELLOW, "YEL" }, { LCD_CYAN, "CYN" }, { LCD_GREY, "GRY" }, { LCD_BLACK, "BLK" },
+    };
+    uint16_t tx, ty;
 
-static void log_time_now(void)
-{
-    rtclock_time_t t;
-    if (rtclock_get(&t)) {
-        log_printf("%04u-%02u-%02u %02u:%02u:%02u", t.year, t.month, t.day, t.hour, t.min, t.sec);
-    } else {
-        log_printf("(clock unreadable)");
-    }
-}
+    lcd_clear(LCD_BLACK);
+    lcd_fill(0, 0, LCD_W, 1, LCD_WHITE);
+    lcd_fill(0, LCD_H - 1, LCD_W, 1, LCD_WHITE);
+    lcd_fill(0, 0, 1, LCD_H, LCD_WHITE);
+    lcd_fill(LCD_W - 1, 0, 1, LCD_H, LCD_WHITE);
 
-static void speed_test(speed_t *r)
-{
-    UINT n;
-    uint32_t chunks = SPEED_BYTES / SPEED_CHUNK;
+    lcd_text(4, 4, "TOP LEFT", LCD_GREEN, LCD_BLACK, 1);
+    lcd_text((uint16_t)(LCD_W - 4 - lcd_text_width("TOP RIGHT", 1)), 4, "TOP RIGHT", LCD_GREEN, LCD_BLACK, 1);
+    lcd_text(4, LCD_H - 14, "BOTTOM LEFT", LCD_GREEN, LCD_BLACK, 1);
+    lcd_text((uint16_t)(LCD_W - 4 - lcd_text_width("BOTTOM RIGHT", 1)), LCD_H - 14, "BOTTOM RIGHT", LCD_GREEN, LCD_BLACK, 1);
 
-    memset(r, 0, sizeof(*r));
-    if (f_open(&file, SPEED_FILE, FA_CREATE_ALWAYS | FA_WRITE | FA_READ) != FR_OK) {
-        r->error = "cannot create test file";
-        return;
-    }
-    /* Pre-allocate a contiguous area, as the recorder will */
-    if (f_expand(&file, SPEED_BYTES, 1) != FR_OK) {
-        r->error = "not enough contiguous free space (16 MB)";
-        f_close(&file);
-        f_unlink(SPEED_FILE);
-        return;
+    lcd_text(40, 40, "SCREEN TEST", LCD_WHITE, LCD_BLACK, 3);        /* 11 chars x 24 = 264 px */
+    lcd_text(40, 80, "Tap to continue", LCD_WHITE, LCD_BLACK, 2);    /* 15 chars x 16 = 240 px */
+
+    for (unsigned i = 0; i < 8; i++) {
+        uint16_t x = (uint16_t)(i * 40);
+        lcd_fill(x, 150, 40, 50, bars[i].color);
+        lcd_text((uint16_t)(x + 8), 205, bars[i].name, LCD_WHITE, LCD_BLACK, 1);
     }
 
     uint32_t t0 = HAL_GetTick();
-    for (uint32_t i = 0; i < chunks; i++) {
-        uint32_t c0 = HAL_GetTick();
-        if (f_write(&file, SPEED_SRC + (i % 16) * SPEED_CHUNK, SPEED_CHUNK, &n) != FR_OK || n != SPEED_CHUNK) {
-            r->error = "write failed";
-            goto out;
-        }
-        uint32_t dt = HAL_GetTick() - c0;
-        if (dt > r->max_chunk_ms) r->max_chunk_ms = dt;
+    while (!touch_read_raw(&tx, &ty) && HAL_GetTick() - t0 < 60000) {
+        HAL_Delay(20);
     }
-    if (f_sync(&file) != FR_OK) {
-        r->error = "sync failed";
-        goto out;
+    while (touch_read_raw(&tx, &ty)) {
+        HAL_Delay(20);
     }
-    uint32_t t_write = HAL_GetTick() - t0;
-
-    f_lseek(&file, 0);
-    t0 = HAL_GetTick();
-    for (uint32_t i = 0; i < chunks; i++) {
-        if (f_read(&file, SPEED_DST, SPEED_CHUNK, &n) != FR_OK || n != SPEED_CHUNK) {
-            r->error = "read failed";
-            goto out;
-        }
-        if (memcmp(SPEED_DST, SPEED_SRC + (i % 16) * SPEED_CHUNK, SPEED_CHUNK) != 0) {
-            r->error = "data read back does not match";
-            goto out;
-        }
-    }
-    uint32_t t_read = HAL_GetTick() - t0;
-
-    r->write_kbps = t_write ? (uint32_t)((uint64_t)SPEED_BYTES * 1000 / 1024 / t_write) : 0;
-    r->read_kbps = t_read ? (uint32_t)((uint64_t)SPEED_BYTES * 1000 / 1024 / t_read) : 0;
-    r->ok = true;
-out:
-    f_close(&file);
-    f_unlink(SPEED_FILE);
 }
 
-static void log_speed(const char *label, const speed_t *s)
+/* ------------------------------------------------------------ touch */
+
+typedef struct {
+    bool swap;                 /* screen X comes from raw y */
+    int32_t x0, rx0, x_num, x_den;
+    int32_t y0, ry0, y_num, y_den;
+} touch_cal_t;
+
+static touch_cal_t cal = {
+    /* Measured on the device 2026-09-28: raw (204,45) at (30,30), raw (0,302) at (290,210) */
+    .swap = true, .x0 = 30, .rx0 = 45, .x_num = 260, .x_den = 257,
+    .y0 = 30, .ry0 = 204, .y_num = 180, .y_den = -204,
+};
+
+static void touch_map(uint16_t rx, uint16_t ry, int32_t *sx, int32_t *sy)
 {
-    if (!s->ok) {
-        log_printf("  %s: FAILED (%s)\r\n", label, s->error);
+    int32_t a = cal.swap ? ry : rx;   /* raw value that drives screen X */
+    int32_t b = cal.swap ? rx : ry;
+    *sx = cal.x0 + (a - cal.rx0) * cal.x_num / cal.x_den;
+    *sy = cal.y0 + (b - cal.ry0) * cal.y_num / cal.y_den;
+}
+
+/* Wait for a touch, average a few samples, then wait for release. */
+static bool wait_tap(uint16_t *rx, uint16_t *ry, uint32_t timeout_ms)
+{
+    uint32_t t0 = HAL_GetTick();
+    uint16_t x, y;
+
+    while (!touch_read_raw(&x, &y)) {
+        if (HAL_GetTick() - t0 > timeout_ms) return false;
+        HAL_Delay(10);
+    }
+    uint32_t sx = 0, sy = 0, n = 0;
+    for (int i = 0; i < 8; i++) {
+        HAL_Delay(15);
+        if (touch_read_raw(&x, &y)) { sx += x; sy += y; n++; }
+    }
+    while (touch_read_raw(&x, &y)) HAL_Delay(10);
+    if (n == 0) return false;
+    *rx = (uint16_t)(sx / n);
+    *ry = (uint16_t)(sy / n);
+    return true;
+}
+
+static void draw_target(int32_t x, int32_t y, uint16_t color)
+{
+    lcd_fill((uint16_t)(x - 12), (uint16_t)y, 25, 1, color);
+    lcd_fill((uint16_t)x, (uint16_t)(y - 12), 1, 25, color);
+    lcd_fill((uint16_t)(x - 3), (uint16_t)(y - 3), 7, 7, color);
+}
+
+static void touch_calibrate(void)
+{
+    const int32_t ax = 30, ay = 30, bx = LCD_W - 30, by = LCD_H - 30;
+    uint16_t arx, ary, brx, bry;
+
+    lcd_clear(LCD_BLACK);
+    lcd_text(60, 100, "Tap the red target", LCD_WHITE, LCD_BLACK, 2);
+    draw_target(ax, ay, LCD_RED);
+    if (!wait_tap(&arx, &ary, 30000)) {
+        log_printf("Touch calibration: no tap, using default mapping\r\n");
         return;
     }
-    log_printf("  %s: ", label);
-    log_mbps("write ", s->write_kbps);
-    log_mbps(", read+verify ", s->read_kbps);
-    log_printf(", slowest 64 KB write %lu ms\r\n", s->max_chunk_ms);
+    draw_target(ax, ay, LCD_BLACK);
+    draw_target(bx, by, LCD_RED);
+    if (!wait_tap(&brx, &bry, 30000)) {
+        log_printf("Touch calibration: no second tap, using default mapping\r\n");
+        return;
+    }
+
+    /* The raw axis that changed most between the targets follows screen X (the longer distance) */
+    int32_t dxr = (int32_t)brx - arx, dyr = (int32_t)bry - ary;
+    cal.swap = abs(dyr) > abs(dxr);
+    int32_t da = cal.swap ? dyr : dxr;   /* raw change along screen X */
+    int32_t db = cal.swap ? dxr : dyr;   /* raw change along screen Y */
+    if (da == 0 || db == 0) {
+        log_printf("Touch calibration: taps too close, using default mapping\r\n");
+        return;
+    }
+    cal.x0 = ax; cal.rx0 = cal.swap ? ary : arx; cal.x_num = bx - ax; cal.x_den = da;
+    cal.y0 = ay; cal.ry0 = cal.swap ? arx : ary; cal.y_num = by - ay; cal.y_den = db;
+    log_printf("Touch calibration: raw (%u,%u) at (%ld,%ld), raw (%u,%u) at (%ld,%ld); axes %s, X %s, Y %s\r\n",
+               arx, ary, ax, ay, brx, bry, bx, by, cal.swap ? "swapped" : "straight",
+               (cal.x_num > 0) == (cal.x_den > 0) ? "normal" : "mirrored",
+               (cal.y_num > 0) == (cal.y_den > 0) ? "normal" : "mirrored");
 }
 
-static void blink_forever(bool all_ok)
+static void touch_test(void)
 {
-    const uint32_t half_period = all_ok ? 500 : 100;
+    char line[48];
+    int32_t lx = -1, ly = -1;
+    uint32_t taps = 0, last_flush = HAL_GetTick();
+    bool was_down = false;
+
+    lcd_clear(LCD_BLACK);
+    lcd_text(10, 8, "TOUCH TEST: draw with a finger", LCD_WHITE, LCD_BLACK, 1);
+    lcd_text(10, 22, "Top-left corner is here", LCD_GREY, LCD_BLACK, 1);
+    lcd_fill(0, 0, 6, 6, LCD_GREEN);
+
     while (1) {
-        board_led(true);
-        HAL_Delay(half_period);
-        board_led(false);
-        HAL_Delay(half_period);
+        uint16_t rx, ry;
+        if (touch_read_raw(&rx, &ry)) {
+            int32_t sx, sy;
+            touch_map(rx, ry, &sx, &sy);
+            if (sx >= 0 && sx < LCD_W && sy >= 0 && sy < LCD_H) {
+                if (lx >= 0 && (abs(sx - lx) > 1 || abs(sy - ly) > 1)) {
+                    lcd_fill((uint16_t)lx, (uint16_t)ly, 3, 3, LCD_GREY);   /* trail */
+                }
+                lcd_fill((uint16_t)sx, (uint16_t)sy, 3, 3, LCD_YELLOW);
+                lx = sx; ly = sy;
+            }
+            snprintf(line, sizeof(line), "raw %4u,%4u  screen %4ld,%4ld  ", rx, ry, sx, sy);
+            lcd_text(10, LCD_H - 14, line, LCD_CYAN, LCD_BLACK, 1);
+            if (!was_down) {
+                taps++;
+                if (taps <= 20) log_printf("  touch %lu: raw %u,%u -> screen %ld,%ld\r\n", taps, rx, ry, sx, sy);
+            }
+            was_down = true;
+        } else {
+            was_down = false;
+        }
+        if (mounted && HAL_GetTick() - last_flush > 5000) {
+            log_flush();
+            last_flush = HAL_GetTick();
+        }
+        HAL_Delay(15);
+        board_led((HAL_GetTick() / 500) & 1);
     }
 }
+
+/* ------------------------------------------------------------ main */
 
 int main(void)
 {
-    uint8_t result = 0;
-    bool log_ok = false, mounted = false;
-
     board_early_init();
     HAL_Init();
     board_init();
-    board_led(true);
-
-    /* LED check: light each carrier LED alone, bit0 first */
-    for (int i = 0; i < 5; i++) {
-        board_leds_carrier((uint8_t)(1 << i));
-        HAL_Delay(400);
-    }
-
-    /* 1: clock */
     board_leds_carrier(1);
+
     rtclock_status_t rtc = rtclock_init();
-    if (rtc == RTCLOCK_KEPT || rtc == RTCLOCK_SET_DEFAULT) result |= 1 << 1;
-
     log_printf("\r\n===== %s boot at ", fw_version);
-    log_time_now();
-    log_printf(" =====\r\n");
-    log_printf("Built:        %s %s\r\n", __DATE__, __TIME__);
-    log_printf("CPU:          STM32H7 device 0x%03lx rev 0x%04lx (%s), %lu MHz, flash %u KB\r\n",
-               HAL_GetDEVID(), HAL_GetREVID(), HAL_GetREVID() >= REV_ID_V ? "V" : "Y",
-               board_sysclk_hz() / 1000000, *(uint16_t *)FLASHSIZE_BASE);
-    log_printf("Reset cause:  %s (RSR 0x%08lx)\r\n", board_reset_cause_str(), board_reset_cause());
-    log_printf("Clock:        %s\r\n", rtclock_status_str(rtc));
+    rtclock_time_t t;
+    if (rtclock_get(&t)) {
+        log_printf("%04u-%02u-%02u %02u:%02u:%02u", t.year, t.month, t.day, t.hour, t.min, t.sec);
+    }
+    log_printf(" =====\r\nReset cause:  %s\r\nClock:        %s\r\n", board_reset_cause_str(), rtclock_status_str(rtc));
 
-    /* 2: SDRAM */
     board_leds_carrier(2);
-    if (!sdram_init()) {
-        log_printf("SDRAM:        FAILED to initialise\r\n");
-    } else {
-        sdram_test_t st;
-        uint32_t t0 = HAL_GetTick();
-        sdram_test(&st);
-        uint32_t dt = HAL_GetTick() - t0;
-        if (st.ok) {
-            result |= 1 << 0;
-            log_printf("SDRAM:        32 MB OK in %lu ms (", dt);
-            log_mbps("fill ", st.write_kbps);
-            log_mbps(", verify ", st.read_kbps);
-            log_printf(")\r\n");
-        } else {
-            log_printf("SDRAM:        FAILED at %s, address 0x%08lx: wrote 0x%08lx, read 0x%08lx\r\n",
-                       st.fail_stage, st.fail_addr, st.fail_expected, st.fail_read);
-        }
-    }
+    log_printf("SDRAM:        %s\r\n", sdram_init() ? "initialised" : "FAILED to initialise");
 
-    /* 3: SD card */
     board_leds_carrier(3);
-    if (!sdcard_init()) {
-        log_printf("SD card:      not found or init failed (detect pin %s)\r\n", sdcard_present() ? "high" : "low");
+    if (sdcard_init() && f_mount(&fs, "", 1) == FR_OK) {
+        mounted = true;
+        sdcard_set_high_speed(true);
+        log_printf("SD card:      mounted\r\n");
+    }
+
+    board_leds_carrier(4);
+    if (!lcd_init()) {
+        log_printf("Display:      SPI init FAILED\r\n");
     } else {
-        sdcard_info_t ci;
-        sdcard_info(&ci);
-        log_printf("SD card:      %s, %lu MB, bus 4-bit %lu MHz, detect pin %s\r\n",
-                   ci.card_type == CARD_SDHC_SDXC ? "SDHC/SDXC" : "SDSC",
-                   ci.blocks / 2048, ci.clock_hz / 1000000, sdcard_present() ? "high" : "low");
-        FRESULT fr = f_mount(&fs, "", 1);
-        if (fr != FR_OK) {
-            log_printf("File system:  mount failed (FatFs error %d)\r\n", fr);
-        } else {
-            FATFS *pfs;
-            DWORD free_clust;
-            mounted = true;
-            result |= 1 << 2;
-            if (f_getfree("", &free_clust, &pfs) == FR_OK) {
-                uint64_t free_mb = (uint64_t)free_clust * pfs->csize / 2048;
-                log_printf("File system:  %s, %lu MB free, cluster %lu KB\r\n",
-                           pfs->fs_type == FS_EXFAT ? "exFAT" : pfs->fs_type == FS_FAT32 ? "FAT32" : "FAT",
-                           (uint32_t)free_mb, (uint32_t)pfs->csize / 2);
-            }
-            log_ok = log_flush();     /* save what we have before the speed test */
-        }
+        uint8_t id[4];
+        lcd_read_id(id);
+        log_printf("Display:      ID bytes %02x %02x %02x %02x (ILI9341 = xx 00 93 41)\r\n", id[0], id[1], id[2], id[3]);
     }
 
-    /* 4-5: card speed at 24 MHz, then 48 MHz */
-    if (mounted && (result & 1)) {
-        speed_t s24, s48;
-
-        for (uint32_t i = 0; i < 16 * SPEED_CHUNK / 4; i++) {
-            ((uint32_t *)SPEED_SRC)[i] = i * 2654435761u;
-        }
-        board_leds_carrier(4);
-        log_printf("Card speed (16 MB file, 64 KB writes):\r\n");
-        speed_test(&s24);
-        log_speed("24 MHz", &s24);
-
-        board_leds_carrier(5);
-        speed_t *best = &s24;
-        if (!sdcard_set_high_speed(true)) {
-            log_printf("  48 MHz: card does not support high-speed mode\r\n");
-        } else {
-            speed_test(&s48);
-            log_speed("48 MHz", &s48);
-            if (s48.ok && s48.write_kbps > s24.write_kbps) {
-                best = &s48;
-            } else {
-                sdcard_set_high_speed(false);
-                log_printf("  staying at 24 MHz\r\n");
-            }
-        }
-        if (best->ok && best->write_kbps >= REQUIRED_WRITE_KBPS) {
-            result |= 1 << 4;
-            log_printf("  fast enough for recording\r\n");
-        } else {
-            log_printf("  TOO SLOW for the fastest line rates (need 6 MB/s)\r\n");
-        }
-    } else if (mounted) {
-        log_printf("Card speed:   skipped (needs working SDRAM)\r\n");
+    board_leds_carrier(5);
+    touch_info_t ti;
+    if (touch_init(&ti)) {
+        log_printf("Touch:        responds at 0x38; vendor 0x%02x, chip 0x%02x, firmware 0x%02x\r\n",
+                   ti.vendor_id, ti.chip_id, ti.fw_version);
+    } else {
+        log_printf("Touch:        NO RESPONSE at 0x38 (INT pin %s)\r\n", touch_int_active() ? "low" : "high");
     }
+    if (mounted) log_flush();
 
-    /* 6: write the report */
-    board_leds_carrier(6);
-    log_printf("Result:       %s\r\n", (result | (1 << 3)) == 0x1F ? "ALL PASSED" : "SOME TESTS FAILED");
-    if (mounted) {
-        log_ok = log_flush();
-    }
-    if (log_ok) result |= 1 << 3;
-
-    board_leds_carrier(result);
-    blink_forever(result == 0x1F);
+    board_leds_carrier(0);
+    orientation_test();
+    touch_calibrate();
+    if (mounted) log_flush();
+    log_printf("Touch test:\r\n");
+    touch_test();
 }

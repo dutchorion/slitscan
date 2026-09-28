@@ -4,7 +4,7 @@ set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/arm-none-eabi.cmake)
 project(slitscan C ASM)
 
 set(CMAKE_C_STANDARD 11)
-set(FW_VERSION "2.0.0-m1.1")
+set(FW_VERSION "2.0.0-m2.1")
 
 set(DRIVERS ${CMAKE_CURRENT_SOURCE_DIR}/../Drivers)
 set(HAL ${DRIVERS}/STM32H7xx_HAL_Driver)
@@ -29,6 +29,8 @@ set(HAL_SOURCES
     ${HAL}/Src/stm32h7xx_hal_sd.c
     ${HAL}/Src/stm32h7xx_hal_sd_ex.c
     ${HAL}/Src/stm32h7xx_hal_sdram.c
+    ${HAL}/Src/stm32h7xx_hal_spi.c
+    ${HAL}/Src/stm32h7xx_hal_spi_ex.c
     ${HAL}/Src/stm32h7xx_ll_delayblock.c
     ${HAL}/Src/stm32h7xx_ll_fmc.c
     ${HAL}/Src/stm32h7xx_ll_sdmmc.c
@@ -48,6 +50,9 @@ add_executable(slitscan
     src/sdcard.c
     src/diskio.c
     src/log.c
+    src/lcd.c
+    src/font7x10.c
+    src/touch.c
     src/syscalls.c
     src/stm32h7xx_it.c
     src/system_stm32h7xx.c
